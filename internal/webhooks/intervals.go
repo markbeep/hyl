@@ -21,13 +21,13 @@ type Intervals struct {
 	Cfg    config.Config
 	Log    *zap.Logger
 	Worker *sync.Worker
-	// Activities propagates provider-side deletions; it is optional so tests
-	// can exercise the handler without the activity store.
-	Activities *activity.Handlers
+	// Activities applies provider-side deletions through the activity store;
+	// optional for webhook handlers that only trigger imports.
+	Activities *activity.Store
 }
 
 // NewIntervals builds the intervals webhook handler.
-func NewIntervals(pool *sql.DB, cfg config.Config, log *zap.Logger, worker *sync.Worker, activities *activity.Handlers) *Intervals {
+func NewIntervals(pool *sql.DB, cfg config.Config, log *zap.Logger, worker *sync.Worker, activities *activity.Store) *Intervals {
 	return &Intervals{Q: db.New(pool), Cfg: cfg, Log: log, Worker: worker, Activities: activities}
 }
 

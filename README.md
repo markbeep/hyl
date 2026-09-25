@@ -8,7 +8,9 @@ both the REST API and the embedded SolidJS frontend.
 - **Activities.** Upload FIT or GPX files (optionally gzipped) from the web UI
   or the developer API. Metrics are computed server-side, sports are normalised
   to `run`, `ride`, `swim`, `hike`, `walk`, `ski`, `row` and `other`, and
-  per-user privacy zones hide chosen areas from other viewers.
+  per-user privacy zones hide chosen areas from other viewers. Deleting an
+  activity removes its photo files and prevents that activity from being
+  re-imported or uploaded again by the same athlete.
 - **Social feed.** Follows (with approval for private accounts), likes,
   comments, @mentions and notifications, with per-activity visibility.
 - **Import from intervals.icu.** Connect with a personal API key or through
@@ -206,8 +208,9 @@ either half missing is not registered and `/auth/<provider>` returns 404.
   writes to intervals.icu.
 - **Webhook.** Set `HYL_INTERVALS_WEBHOOK_SECRET` to the same shared secret you
   configure on intervals' side. hyl verifies it in constant time on
-  `POST /webhooks/intervals` and triggers a re-sync for the matching athlete;
-  with the variable unset the route answers 404.
+  `POST /webhooks/intervals`; uploads and analyses trigger a re-sync, while
+  deletions remove the matching imported activity, its photo files, and prevent
+  a later re-import. With the variable unset the route answers 404.
 
 ## Developer API
 

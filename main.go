@@ -135,6 +135,9 @@ func serve() error {
 	// Every ingest queues its automatic Strava export through this hook, so
 	// manual uploads, the developer API and provider sync all behave alike.
 	activityStore.ExportQueue = syncpkg.NewExportQueuer(db.New(pool)).Queue
+	// Media rows cascade with the activity, so the store captures their IDs
+	// before commit and hands them to this post-commit cleanup hook.
+	activityStore.RemovePhotos = mediaHandlers.RemovePhotos
 
 	cipher, err := secrets.New(cfg.SecretKey)
 	if err != nil {
@@ -142,7 +145,7 @@ func serve() error {
 	}
 	worker := syncpkg.NewWorker(pool, cfg, log, cipher, activityStore)
 	worker.SetExporter(syncpkg.NewExporter(pool, cfg, log, cipher))
-	activityHandlers := activity.NewHandlers(pool, activityStore, mediaHandlers, log)
+	activityHandlers := activity.NewHandlers(pool, activityStore)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	go worker.Run(workerCtx)
@@ -159,7 +162,7 @@ func serve() error {
 		Social:       social.New(pool, log),
 		Media:        mediaHandlers,
 		Sync:         syncpkg.NewHandlers(pool, cfg, log, cipher, worker),
-		Webhooks:     webhooks.NewIntervals(pool, cfg, log, worker, activityHandlers),
+		Webhooks:     webhooks.NewIntervals(pool, cfg, log, worker, activityStore),
 		StravaEvents: webhooks.NewStrava(pool, cfg, log, cipher),
 		Static:       static,
 	})

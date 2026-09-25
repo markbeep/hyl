@@ -69,11 +69,96 @@ type Store struct {
 	// interface because internal/sync imports this package, which forbids the
 	// reverse dependency.
 	ExportQueue func(ctx context.Context, a db.Activity) error
+	// RemovePhotos removes captured photo files after an activity deletion
+	// commits. The media rows have cascaded by then, so their identities are
+	// collected inside the transaction.
+	RemovePhotos func(ctx context.Context, photos []db.Medium) error
 }
 
 // NewStore builds the activity store.
 func NewStore(pool *sql.DB, log *zap.Logger) *Store {
 	return &Store{Pool: pool, Q: db.New(pool), Log: log}
+}
+
+// Delete removes an activity owned by ownerID and records its dedupe hash so
+// ingest cannot recreate it. Photo files are removed only after commit.
+func (s *Store) Delete(ctx context.Context, ownerID, activityID int64) error {
+	tx, err := s.Pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	queries := s.Q.WithTx(tx)
+	activity, err := queries.GetActivity(ctx, activityID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return apperr.NotFound("no such activity")
+	}
+	if err != nil {
+		return err
+	}
+	if activity.UserID != ownerID {
+		return apperr.Forbidden("only the owner can delete this activity")
+	}
+	return s.deleteActivity(ctx, tx, activity)
+}
+
+// DeleteProviderActivity removes the owner's activity identified by its
+// provider kind and provider activity ID. Unrecognized identities are a no-op.
+func (s *Store) DeleteProviderActivity(ctx context.Context, ownerID int64, source, sourceRef string) error {
+	if source == "" || sourceRef == "" {
+		return nil
+	}
+	tx, err := s.Pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	activity, err := s.Q.WithTx(tx).GetActivityBySourceRef(ctx, ownerID, source, &sourceRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.deleteActivity(ctx, tx, activity); err != nil {
+		return err
+	}
+	s.Log.Info("removed an activity deleted at its source",
+		zap.Int64("user_id", ownerID), zap.String("source", source), zap.String("source_ref", sourceRef))
+	return nil
+}
+
+// deleteActivity writes the tombstone and removes the activity in the caller's
+// transaction, then cleans up captured photo files after commit.
+func (s *Store) deleteActivity(ctx context.Context, tx *sql.Tx, activity db.Activity) error {
+	queries := s.Q.WithTx(tx)
+	activityID := activity.ID
+	var err error
+	var photos []db.Medium
+	if s.RemovePhotos != nil {
+		photos, err = queries.ListActivityMedia(ctx, activityID)
+		if err != nil {
+			return err
+		}
+	}
+	if err := queries.CreateTombstone(ctx, activity.UserID, activity.DedupeHash, time.Now().Unix()); err != nil {
+		return err
+	}
+	if _, err := queries.DeleteActivity(ctx, activityID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.RemovePhotos != nil && len(photos) > 0 {
+		if err := s.RemovePhotos(ctx, photos); err != nil {
+			s.Log.Warn("removing activity photo files failed",
+				zap.Int64("activity_id", activityID), zap.Error(err))
+		}
+	}
+	return nil
 }
 
 // Ingest parses, decimates, simplifies and stores one activity. It is

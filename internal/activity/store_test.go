@@ -3,7 +3,9 @@ package activity
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,8 +14,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/markbeep/hyl/internal/apperr"
 	"github.com/markbeep/hyl/internal/config"
 	"github.com/markbeep/hyl/internal/db"
+	"github.com/markbeep/hyl/internal/media"
 )
 
 // newStoreForTest opens a migrated temporary database with one user, which the
@@ -174,5 +178,316 @@ func TestIngestSurvivesExportQueueProblems(t *testing.T) {
 	}
 	if _, err := queries.GetActivity(ctx, stored.ID); err != nil {
 		t.Fatalf("the activity was not stored: %v", err)
+	}
+}
+
+func TestDeleteOwnedActivityPreventsReimport(t *testing.T) {
+	store, queries, userID := newStoreForTest(t)
+	ctx := context.Background()
+	payload := ingestedFIT(t, time.Date(2026, 5, 1, 7, 0, 0, 0, time.UTC), 5000)
+	stored, err := store.Ingest(ctx, userID, bytes.NewReader(payload), IngestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	photo, err := queries.CreateMedia(ctx, db.CreateMediaParams{
+		UserID: userID, ActivityID: &stored.ID, Kind: "activity", CreatedAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cleaned []int64
+	store.RemovePhotos = func(_ context.Context, photos []db.Medium) error {
+		if _, err := queries.GetActivity(ctx, stored.ID); !errors.Is(err, sql.ErrNoRows) {
+			t.Errorf("callback ran before commit: %v", err)
+		}
+		for _, p := range photos {
+			cleaned = append(cleaned, p.ID)
+		}
+		return nil
+	}
+	if err := store.Delete(ctx, userID, stored.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(cleaned) != 1 || cleaned[0] != photo.ID {
+		t.Fatalf("cleaned media IDs = %v, want [%d]", cleaned, photo.ID)
+	}
+	if _, err := queries.GetActivity(ctx, stored.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted activity still exists: %v", err)
+	}
+	_, err = store.Ingest(ctx, userID, bytes.NewReader(payload), IngestOptions{})
+	var duplicate *DuplicateError
+	if !errors.As(err, &duplicate) || duplicate.ActivityID != 0 {
+		t.Fatalf("reimport error = %v, want deleted duplicate", err)
+	}
+}
+
+func TestDeleteRemovesCommittedPhotoFiles(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(ingestedFIT(t,
+		time.Date(2026, 5, 6, 7, 0, 0, 0, time.UTC), 5000)), IngestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	photo, err := queries.CreateMedia(ctx, db.CreateMediaParams{
+		UserID: ownerID, ActivityID: &stored.ID, Kind: media.KindActivity, CreatedAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := media.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RemovePhotos = media.NewHandlers(svc, store.Pool, store.Log).RemovePhotos
+	for _, variant := range []string{media.VariantFull, media.VariantThumb} {
+		path := svc.Path(media.KindActivity, photo.ID, variant)
+		if err := os.WriteFile(path, []byte("photo"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Delete(ctx, ownerID, stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, variant := range []string{media.VariantFull, media.VariantThumb} {
+		if _, err := os.Stat(svc.Path(media.KindActivity, photo.ID, variant)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("photo %s survived delete: %v", variant, err)
+		}
+	}
+}
+
+func TestDeleteRejectsMissingAndForeignActivities(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(ingestedFIT(t,
+		time.Date(2026, 5, 2, 7, 0, 0, 0, time.UTC), 5000)), IngestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := queries.CreateUser(ctx, db.CreateUserParams{
+		Username: "other", Email: "other@example.com", DisplayName: "Other",
+		CreatedAt: 1, UpdatedAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	store.RemovePhotos = func(context.Context, []db.Medium) error {
+		called = true
+		return nil
+	}
+	var response *apperr.Error
+	if err := store.Delete(ctx, other.ID, stored.ID); !errors.As(err, &response) || response.Code != apperr.CodeForbidden {
+		t.Fatalf("foreign delete error = %v, want forbidden", err)
+	}
+	if called {
+		t.Fatal("photo cleanup ran for foreign activity")
+	}
+	if _, err := queries.GetActivity(ctx, stored.ID); err != nil {
+		t.Fatalf("foreign activity removed: %v", err)
+	}
+	if _, err := queries.GetTombstone(ctx, ownerID, stored.DedupeHash); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("foreign delete wrote tombstone: %v", err)
+	}
+	if err := store.Delete(ctx, ownerID, stored.ID+999); !errors.As(err, &response) || response.Code != apperr.CodeNotFound {
+		t.Fatalf("missing delete error = %v, want not-found", err)
+	}
+}
+
+func TestFailedDeleteKeepsActivityAndPhotos(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	payload := ingestedFIT(t, time.Date(2026, 5, 3, 7, 0, 0, 0, time.UTC), 5000)
+	stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(payload), IngestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	photo, err := queries.CreateMedia(ctx, db.CreateMediaParams{
+		UserID: ownerID, ActivityID: &stored.ID, Kind: "activity", CreatedAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	store.RemovePhotos = func(context.Context, []db.Medium) error {
+		called = true
+		return nil
+	}
+	if _, err := store.Pool.ExecContext(ctx, `CREATE TRIGGER prevent_delete BEFORE DELETE ON activities BEGIN SELECT RAISE(ABORT, 'delete failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete(ctx, ownerID, stored.ID); err == nil {
+		t.Fatal("delete succeeded despite failed row removal")
+	}
+	if called {
+		t.Fatal("photo cleanup ran after rollback")
+	}
+	if _, err := queries.GetActivity(ctx, stored.ID); err != nil {
+		t.Fatalf("activity missing after rollback: %v", err)
+	}
+	if _, err := queries.GetMedia(ctx, photo.ID); err != nil {
+		t.Fatalf("photo row missing after rollback: %v", err)
+	}
+	if _, err := queries.GetTombstone(ctx, ownerID, stored.DedupeHash); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("rollback left tombstone: %v", err)
+	}
+}
+
+func TestDeleteSurvivesPhotoCleanupProblems(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	for i, callback := range []func(context.Context, []db.Medium) error{
+		nil,
+		func(context.Context, []db.Medium) error { return errors.New("disk unavailable") },
+	} {
+		stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(ingestedFIT(t,
+			time.Date(2026, 5, 4+i, 7, 0, 0, 0, time.UTC), 5000)), IngestOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := queries.CreateMedia(ctx, db.CreateMediaParams{
+			UserID: ownerID, ActivityID: &stored.ID, Kind: "activity", CreatedAt: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		store.RemovePhotos = callback
+		if err := store.Delete(ctx, ownerID, stored.ID); err != nil {
+			t.Fatalf("Delete with callback %d: %v", i, err)
+		}
+		if _, err := queries.GetActivity(ctx, stored.ID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("activity survived callback %d: %v", i, err)
+		}
+	}
+}
+
+func TestDeleteProviderActivityRemovesMatchingActivityAndPhotos(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	payload := ingestedFIT(t, time.Date(2026, 7, 1, 7, 0, 0, 0, time.UTC), 5000)
+	stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(payload), IngestOptions{
+		Source: "intervals_oauth", SourceRef: "provider-42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	photo, err := queries.CreateMedia(ctx, db.CreateMediaParams{
+		UserID: ownerID, ActivityID: &stored.ID, Kind: media.KindActivity, CreatedAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := media.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RemovePhotos = media.NewHandlers(svc, store.Pool, store.Log).RemovePhotos
+	for _, variant := range []string{media.VariantFull, media.VariantThumb} {
+		if err := os.WriteFile(svc.Path(media.KindActivity, photo.ID, variant), []byte("photo"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DeleteProviderActivity(ctx, ownerID, "intervals_oauth", "provider-42"); err != nil {
+		t.Fatalf("DeleteProviderActivity: %v", err)
+	}
+	if err := store.DeleteProviderActivity(ctx, ownerID, "intervals_oauth", "provider-42"); err != nil {
+		t.Fatalf("repeated provider deletion: %v", err)
+	}
+	if _, err := queries.GetActivity(ctx, stored.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("provider activity survived: %v", err)
+	}
+	for _, variant := range []string{media.VariantFull, media.VariantThumb} {
+		if _, err := os.Stat(svc.Path(media.KindActivity, photo.ID, variant)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("provider photo %s survived: %v", variant, err)
+		}
+	}
+	_, err = store.Ingest(ctx, ownerID, bytes.NewReader(payload), IngestOptions{
+		Source: "intervals_oauth", SourceRef: "provider-42",
+	})
+	var duplicate *DuplicateError
+	if !errors.As(err, &duplicate) || duplicate.ActivityID != 0 {
+		t.Fatalf("provider reimport error = %v, want deleted duplicate", err)
+	}
+}
+
+func TestDeleteProviderActivityIgnoresUnknownIdentity(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(ingestedFIT(t,
+		time.Date(2026, 7, 2, 7, 0, 0, 0, time.UTC), 5000)), IngestOptions{
+		Source: "intervals_oauth", SourceRef: "provider-42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	store.RemovePhotos = func(context.Context, []db.Medium) error {
+		called = true
+		return nil
+	}
+	for _, identity := range []struct {
+		ownerID int64
+		source  string
+		ref     string
+	}{
+		{ownerID, "", "provider-42"},
+		{ownerID, "intervals_oauth", ""},
+		{ownerID, "intervals_oauth", "unknown"},
+		{ownerID, "intervals_apikey", "provider-42"},
+		{ownerID + 999, "intervals_oauth", "provider-42"},
+	} {
+		if err := store.DeleteProviderActivity(ctx, identity.ownerID, identity.source, identity.ref); err != nil {
+			t.Fatalf("unknown identity %+v: %v", identity, err)
+		}
+	}
+	if _, err := queries.GetActivity(ctx, stored.ID); err != nil {
+		t.Fatalf("unknown provider identity removed activity: %v", err)
+	}
+	if _, err := queries.GetTombstone(ctx, ownerID, stored.DedupeHash); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unknown provider identity wrote tombstone: %v", err)
+	}
+	if called {
+		t.Fatal("photo cleanup ran for unknown provider identity")
+	}
+}
+
+func TestDeleteProviderActivityRollsBackOnFailure(t *testing.T) {
+	store, queries, ownerID := newStoreForTest(t)
+	ctx := context.Background()
+	stored, err := store.Ingest(ctx, ownerID, bytes.NewReader(ingestedFIT(t,
+		time.Date(2026, 7, 3, 7, 0, 0, 0, time.UTC), 5000)), IngestOptions{
+		Source: "intervals_apikey", SourceRef: "provider-99",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	photo, err := queries.CreateMedia(ctx, db.CreateMediaParams{
+		UserID: ownerID, ActivityID: &stored.ID, Kind: media.KindActivity, CreatedAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := media.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RemovePhotos = media.NewHandlers(svc, store.Pool, store.Log).RemovePhotos
+	path := svc.Path(media.KindActivity, photo.ID, media.VariantFull)
+	if err := os.WriteFile(path, []byte("photo"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.ExecContext(ctx, `CREATE TRIGGER prevent_delete BEFORE DELETE ON activities BEGIN SELECT RAISE(ABORT, 'delete failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteProviderActivity(ctx, ownerID, "intervals_apikey", "provider-99"); err == nil {
+		t.Fatal("provider delete succeeded despite failed row removal")
+	}
+	if _, err := queries.GetActivity(ctx, stored.ID); err != nil {
+		t.Fatalf("activity missing after rollback: %v", err)
+	}
+	if _, err := queries.GetTombstone(ctx, ownerID, stored.DedupeHash); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("rollback left tombstone: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("photo removed after rollback: %v", err)
 	}
 }

@@ -275,19 +275,16 @@ func (h *Handlers) DeletePhoto(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// RemoveActivityMedia deletes the files of an activity's photos. The rows go
-// with the activity cascade, so this only touches the disk.
-func (h *Handlers) RemoveActivityMedia(ctx context.Context, activityID int64) {
-	rows, err := h.Q.ListActivityMedia(ctx, activityID)
-	if err != nil {
-		h.Log.Warn("listing activity media failed", zap.Int64("activity_id", activityID), zap.Error(err))
-		return
-	}
-	for _, row := range rows {
-		if err := h.Service.Remove(row.Kind, row.ID); err != nil {
-			h.Log.Warn("removing photo files failed", zap.Int64("media_id", row.ID), zap.Error(err))
+// RemovePhotos removes files whose media rows were captured before the
+// activity delete committed. The rows have cascaded by the time this runs.
+func (h *Handlers) RemovePhotos(_ context.Context, photos []db.Medium) error {
+	var failures []error
+	for _, photo := range photos {
+		if err := h.Service.Remove(photo.Kind, photo.ID); err != nil {
+			failures = append(failures, fmt.Errorf("media %d: %w", photo.ID, err))
 		}
 	}
+	return errors.Join(failures...)
 }
 
 // activityVisibleTo resolves the visibility of the activity a photo belongs to.

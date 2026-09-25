@@ -24,8 +24,7 @@ import (
 )
 
 // newListHandlers builds the activity handlers over a migrated temporary
-// database and no media service, so the list tests drive the real HTTP
-// handlers and the real generated query end to end.
+// database, so the list tests drive real HTTP handlers and generated queries.
 func newListHandlers(t *testing.T) (*Handlers, *db.Queries) {
 	t.Helper()
 	pool, err := db.Open(config.Config{DBPath: filepath.Join(t.TempDir(), "hyl.db")})
@@ -36,7 +35,7 @@ func newListHandlers(t *testing.T) (*Handlers, *db.Queries) {
 	if err := db.Migrate(pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return NewHandlers(pool, NewStore(pool, zap.NewNop()), nil, zap.NewNop()), db.New(pool)
+	return NewHandlers(pool, NewStore(pool, zap.NewNop())), db.New(pool)
 }
 
 func createListUser(t *testing.T, ctx context.Context, queries *db.Queries, username string) db.User {
