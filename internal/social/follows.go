@@ -33,6 +33,10 @@ type Handlers struct {
 	Pool *sql.DB
 	Q    *db.Queries
 	Log  *zap.Logger
+	// ForViewer is the activity-page read. Likes and comments use it so a
+	// hidden activity is the same not-found as a missing id. Production
+	// always sets it; a missing read fails closed.
+	ForViewer func(ctx context.Context, activityID, viewerID int64) (db.Activity, error)
 }
 
 // New builds the social handlers.

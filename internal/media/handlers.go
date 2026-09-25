@@ -19,7 +19,6 @@ import (
 	"github.com/markbeep/hyl/internal/db"
 	"github.com/markbeep/hyl/internal/dto"
 	"github.com/markbeep/hyl/internal/reqctx"
-	"github.com/markbeep/hyl/internal/social"
 )
 
 // Limits for uploads and per-activity photo counts.
@@ -40,6 +39,10 @@ type Handlers struct {
 	Service *Service
 	Q       *db.Queries
 	Log     *zap.Logger
+	// ForViewer is the activity-page read. Activity photos use it only for
+	// allow or deny; avatars skip it. Production always sets it; a missing
+	// read fails closed.
+	ForViewer func(ctx context.Context, activityID, viewerID int64) error
 }
 
 // NewHandlers builds the media HTTP surface.
@@ -70,14 +73,8 @@ func (h *Handlers) Serve(c echo.Context) error {
 		if row.ActivityID == nil {
 			return apperr.NotFound("no such file")
 		}
-		allowed, err := h.activityVisibleTo(ctx, *row.ActivityID, reqctx.UserID(c))
-		if err != nil {
+		if err := h.visibleActivity(ctx, *row.ActivityID, reqctx.UserID(c)); err != nil {
 			return err
-		}
-		if !allowed {
-			// 404 rather than 403: an invisible activity must not be
-			// distinguishable from a missing one.
-			return apperr.NotFound("no such file")
 		}
 	}
 
@@ -290,31 +287,21 @@ func (h *Handlers) RemoveActivityMedia(ctx context.Context, activityID int64) {
 	}
 }
 
-// activityVisibleTo resolves the visibility of the activity a photo belongs to.
-func (h *Handlers) activityVisibleTo(ctx context.Context, activityID, viewerID int64) (bool, error) {
-	activity, err := h.Q.GetActivity(ctx, activityID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+// visibleActivity reports whether the viewer may open the activity a photo
+// belongs to. A missing read, a missing activity, and a hidden activity are
+// all the same not-found as a missing file.
+func (h *Handlers) visibleActivity(ctx context.Context, activityID, viewerID int64) error {
+	if h.ForViewer == nil {
+		return apperr.NotFound("no such file")
 	}
-	if err != nil {
-		return false, err
-	}
-	owner, err := h.Q.GetUserByID(ctx, activity.UserID)
-	if err != nil {
-		return false, err
-	}
-	follower := false
-	if viewerID != 0 && viewerID != owner.ID {
-		follow, err := h.Q.GetFollow(ctx, viewerID, owner.ID)
-		switch {
-		case err == nil:
-			follower = follow.Status == "accepted"
-		case errors.Is(err, sql.ErrNoRows):
-		default:
-			return false, err
+	if err := h.ForViewer(ctx, activityID, viewerID); err != nil {
+		var appErr *apperr.Error
+		if errors.As(err, &appErr) && appErr.Status == http.StatusNotFound {
+			return apperr.NotFound("no such file")
 		}
+		return err
 	}
-	return social.VisibilityAllows(viewerID, owner.ID, follower, activity.Visibility, owner.ActivitiesVisibility), nil
+	return nil
 }
 
 func serveFile(c echo.Context, path string) error {

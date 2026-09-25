@@ -17,7 +17,6 @@ import (
 	"github.com/markbeep/hyl/internal/dto"
 	"github.com/markbeep/hyl/internal/media"
 	"github.com/markbeep/hyl/internal/reqctx"
-	"github.com/markbeep/hyl/internal/social"
 )
 
 // SourceContextKey lets a caller (the developer API) declare that an upload
@@ -390,50 +389,19 @@ func (h *Handlers) page(ctx context.Context, params db.ListActivitiesParams) ([]
 	return items, nil
 }
 
-// detail loads everything the single-activity payload needs.
+// detail loads everything the single-activity payload needs. Who may see the
+// activity, and how its map is trimmed, come from ForViewer.
 func (h *Handlers) detail(c echo.Context, id, viewerID int64) (api.ActivityDetail, error) {
 	ctx := c.Request().Context()
 
-	activity, err := h.Q.GetActivity(ctx, id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return api.ActivityDetail{}, apperr.NotFound("no such activity")
-	}
+	opened, err := h.ForViewer(ctx, id, viewerID)
 	if err != nil {
 		return api.ActivityDetail{}, err
 	}
-	owner, err := h.Q.GetUserByID(ctx, activity.UserID)
-	if err != nil {
-		return api.ActivityDetail{}, err
-	}
-
-	follower := false
-	if viewerID != 0 && viewerID != owner.ID {
-		follow, err := h.Q.GetFollow(ctx, viewerID, owner.ID)
-		switch {
-		case err == nil:
-			follower = follow.Status == "accepted"
-		case errors.Is(err, sql.ErrNoRows):
-		default:
-			return api.ActivityDetail{}, err
-		}
-	}
-	if !social.VisibilityAllows(viewerID, owner.ID, follower, activity.Visibility, owner.ActivitiesVisibility) {
-		return api.ActivityDetail{}, apperr.NotFound("no such activity")
-	}
-
-	points, err := h.points(ctx, id)
-	if err != nil {
-		return api.ActivityDetail{}, err
-	}
-	zones, err := newZoneCache(ctx, h.Q).forOwner(owner.ID, owner.TrimScope)
-	if err != nil {
-		return api.ActivityDetail{}, err
-	}
-
-	track, mapAvailable := TrackCoordinates(points, activity.RouteHidden, zones, owner.TrimScope,
-		float64(owner.TrimRadiusM), activity.DistanceM, listTrackPoints)
-	route, _ := TrackCoordinates(points, activity.RouteHidden, zones, owner.TrimScope,
-		float64(owner.TrimRadiusM), activity.DistanceM, detailRoutePoints)
+	activity := opened.Activity
+	owner := opened.Owner
+	points := opened.Points
+	track, mapAvailable, route := opened.Track, opened.MapAvailable, opened.Route
 
 	counts, err := h.counts(ctx, id, viewerID)
 	if err != nil {

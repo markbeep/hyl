@@ -66,32 +66,11 @@ func (h *Handlers) Like(c echo.Context) error {
 
 // visibleActivity loads an activity the viewer is allowed to see. An invisible
 // activity is reported as missing rather than forbidden, so the endpoint cannot
-// be used to probe for private ids.
+// be used to probe for private ids. The owner and follow are loaded by the
+// activity-page read, not here.
 func (h *Handlers) visibleActivity(ctx context.Context, activityID, viewerID int64) (db.Activity, error) {
-	activity, err := h.Q.GetActivity(ctx, activityID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return activity, apperr.NotFound("no such activity")
+	if h.ForViewer == nil {
+		return db.Activity{}, apperr.NotFound("no such activity")
 	}
-	if err != nil {
-		return activity, err
-	}
-	owner, err := h.Q.GetUserByID(ctx, activity.UserID)
-	if err != nil {
-		return activity, err
-	}
-	follower := false
-	if viewerID != 0 && viewerID != owner.ID {
-		follow, err := h.Q.GetFollow(ctx, viewerID, owner.ID)
-		switch {
-		case err == nil:
-			follower = follow.Status == "accepted"
-		case errors.Is(err, sql.ErrNoRows):
-		default:
-			return activity, err
-		}
-	}
-	if !VisibilityAllows(viewerID, owner.ID, follower, activity.Visibility, owner.ActivitiesVisibility) {
-		return activity, apperr.NotFound("no such activity")
-	}
-	return activity, nil
+	return h.ForViewer(ctx, activityID, viewerID)
 }

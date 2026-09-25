@@ -143,6 +143,18 @@ func serve() error {
 	worker := syncpkg.NewWorker(pool, cfg, log, cipher, activityStore)
 	worker.SetExporter(syncpkg.NewExporter(pool, cfg, log, cipher))
 	activityHandlers := activity.NewHandlers(pool, activityStore, mediaHandlers, log)
+	mediaHandlers.ForViewer = func(ctx context.Context, activityID, viewerID int64) error {
+		_, err := activityHandlers.ForViewer(ctx, activityID, viewerID)
+		return err
+	}
+	socialHandlers := social.New(pool, log)
+	socialHandlers.ForViewer = func(ctx context.Context, activityID, viewerID int64) (db.Activity, error) {
+		opened, err := activityHandlers.ForViewer(ctx, activityID, viewerID)
+		if err != nil {
+			return db.Activity{}, err
+		}
+		return opened.Activity, nil
+	}
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	go worker.Run(workerCtx)
@@ -156,7 +168,7 @@ func serve() error {
 		Users:        users.New(pool, log),
 		Activity:     activityHandlers,
 		Developer:    developer.New(pool, log, activityHandlers),
-		Social:       social.New(pool, log),
+		Social:       socialHandlers,
 		Media:        mediaHandlers,
 		Sync:         syncpkg.NewHandlers(pool, cfg, log, cipher, worker),
 		Webhooks:     webhooks.NewIntervals(pool, cfg, log, worker, activityHandlers),

@@ -105,8 +105,13 @@ func (h *Handlers) Get(c echo.Context) error {
 		return err
 	}
 
-	track, mapAvailable := activity.TrackCoordinates(toPoints(points), row.RouteHidden, nil,
-		user.TrimScope, float64(user.TrimRadiusM), row.DistanceM, 4000)
+	// The key stays owner-only above. The summary map is the activity-page route,
+	// so privacy zones, start and end trimming, and a hidden route match that page.
+	opened, err := h.Activity.ForViewer(ctx, activityID, user.ID)
+	if err != nil {
+		return err
+	}
+	track, mapAvailable := opened.Route, opened.MapAvailable
 	summary := dto.ActivitySummaryFromActivity(row, *user, avatarID, counts, track, mapAvailable, nil)
 
 	return c.JSON(http.StatusOK, api.DeveloperActivity{
@@ -126,30 +131,6 @@ func (h *Handlers) avatarID(ctx context.Context, userID int64) (int64, error) {
 		return 0, err
 	}
 	return avatar.ID, nil
-}
-
-func toPoints(rows []db.ActivityPoint) []activity.Point {
-	points := make([]activity.Point, 0, len(rows))
-	for _, row := range rows {
-		point := activity.Point{
-			Seq: row.Seq, T: row.T, ElapsedS: row.ElapsedS,
-			Lat: row.Lat, Lon: row.Lon, Ele: row.Ele, Spd: row.Spd, DistM: row.DistM,
-		}
-		if row.Hr != nil {
-			hr := int(*row.Hr)
-			point.HR = &hr
-		}
-		if row.Cad != nil {
-			cadence := int(*row.Cad)
-			point.Cad = &cadence
-		}
-		if row.Pwr != nil {
-			power := int(*row.Pwr)
-			point.Pwr = &power
-		}
-		points = append(points, point)
-	}
-	return points
 }
 
 func toDeveloperPoints(rows []db.ActivityPoint) []api.DeveloperPoint {
