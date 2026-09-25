@@ -2,8 +2,19 @@ name: build
 on:
   push:
     branches: [main]
-    paths: &paths ["internal/**", "frontend/**", "main.go", "assets.go", "go.mod", "go.sum",
-                   "sqlc.yaml", "tygo.yaml", "Dockerfile", ".github/workflows/build.yml"]
+    paths:
+      &paths [
+        "internal/**",
+        "frontend/**",
+        "main.go",
+        "assets.go",
+        "go.mod",
+        "go.sum",
+        "sqlc.yaml",
+        "tygo.yaml",
+        "Dockerfile",
+        ".github/workflows/build.yml",
+      ]
   pull_request:
     paths: *paths
 jobs:
@@ -45,6 +56,6 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: |
-            ${{ secrets.DOCKER_HUB_USERNAME }}/hyl:latest
-            ${{ secrets.DOCKER_HUB_USERNAME }}/hyl:${{ github.sha }}
+            ${{ secrets.DOCKER_HUB_USERNAME || 'hyl' }}/hyl:latest
+            ${{ secrets.DOCKER_HUB_USERNAME || 'hyl' }}/hyl:${{ github.sha }}
           build-args: VERSION=${{ github.sha }}
