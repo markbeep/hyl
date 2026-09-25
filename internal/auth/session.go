@@ -100,6 +100,12 @@ func (s *Service) resolve(ctx context.Context, token string) (*db.User, bool, er
 	return &user, renewed, nil
 }
 
+// ExpireSessions deletes session rows whose lifetime has elapsed. A session
+// that is still inside its lifetime remains.
+func (s *Service) ExpireSessions(ctx context.Context) (int64, error) {
+	return s.Q.DeleteExpiredSessions(ctx, time.Now().Unix())
+}
+
 // DeleteSession removes one session by token.
 func (s *Service) DeleteSession(ctx context.Context, token string) error {
 	if token == "" {

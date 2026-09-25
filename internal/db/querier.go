@@ -52,7 +52,9 @@ type Querier interface {
 	DeleteIdentity(ctx context.Context, userID int64, provider string) (int64, error)
 	DeleteImportRulesForConnection(ctx context.Context, userID int64, connectionKind string) (int64, error)
 	DeleteOtherSessionsForUser(ctx context.Context, userID int64, tokenHash []byte) (int64, error)
-	DeletePendingExportsForUser(ctx context.Context, userID int64) (int64, error)
+	// Pending rows are removed only for the target the disconnected provider owns.
+	// Sent and errored rows stay as history. intervals.icu owns no export target.
+	DeletePendingExportsForTarget(ctx context.Context, userID int64, target string) (int64, error)
 	DeletePrivacyZone(ctx context.Context, iD int64, userID int64) (int64, error)
 	DeleteSession(ctx context.Context, tokenHash []byte) (int64, error)
 	DeleteSessionsForUser(ctx context.Context, userID int64) (int64, error)

@@ -15,8 +15,6 @@ import (
 
 	"github.com/markbeep/hyl/internal/apperr"
 	"github.com/markbeep/hyl/internal/config"
-	"github.com/markbeep/hyl/internal/db"
-	"github.com/markbeep/hyl/internal/secrets"
 )
 
 // Strava serves its REST API and its OAuth endpoints from separate bases as of
@@ -131,16 +129,6 @@ func refreshStravaToken(ctx context.Context, baseURL string, cfg config.Config, 
 	form.Set("refresh_token", refreshToken)
 	form.Set("grant_type", "refresh_token")
 	return stravaTokenRequest(ctx, baseURL, form)
-}
-
-// CheckStravaRefresh rotates a stored Strava refresh token for a caller that
-// only needs to know whether the connection is still alive. It exists because
-// Strava signs nothing it sends to a webhook, while its token endpoint is
-// authoritative: a revoked connection's refresh token is rejected outright,
-// whereas a live one is simply rotated (and the caller must persist the pair,
-// since Strava invalidates the previous refresh token immediately).
-func CheckStravaRefresh(ctx context.Context, cfg config.Config, refreshToken string) (StravaTokens, error) {
-	return refreshStravaToken(ctx, stravaOAuthBase(cfg), cfg, refreshToken)
 }
 
 // StravaAuthorizeURL builds the consent URL.
@@ -336,35 +324,4 @@ func (c *StravaClient) do(req *http.Request, out any) error {
 		return nil
 	}
 	return json.Unmarshal(payload, out)
-}
-
-// ensureStravaToken refreshes the access token when it is close to expiry and
-// persists the rotated pair.
-func ensureStravaToken(ctx context.Context, baseURL string, cfg config.Config, q *db.Queries, cipher *secrets.Cipher, conn db.Connection, now time.Time) (db.Connection, error) {
-	if conn.TokenExpiresAt != nil && *conn.TokenExpiresAt-now.Unix() > stravaRefreshWindow {
-		return conn, nil
-	}
-	refreshToken, err := cipher.DecryptString(conn.RefreshTokenCipher)
-	if err != nil || refreshToken == "" {
-		return conn, apperr.BadRequest("this Strava connection has no refresh token; reconnect it")
-	}
-	tokens, err := refreshStravaToken(ctx, baseURL, cfg, refreshToken)
-	if err != nil {
-		return conn, err
-	}
-	access, err := cipher.EncryptString(tokens.AccessToken)
-	if err != nil {
-		return conn, err
-	}
-	rotated, err := cipher.EncryptString(tokens.RefreshToken)
-	if err != nil {
-		return conn, err
-	}
-	if _, err := q.UpdateConnectionTokens(ctx, access, rotated, &tokens.ExpiresAt, now.Unix(), conn.ID); err != nil {
-		return conn, err
-	}
-	conn.AccessTokenCipher = access
-	conn.RefreshTokenCipher = rotated
-	conn.TokenExpiresAt = &tokens.ExpiresAt
-	return conn, nil
 }

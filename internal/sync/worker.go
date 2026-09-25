@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/markbeep/hyl/internal/activity"
+	"github.com/markbeep/hyl/internal/auth"
 	"github.com/markbeep/hyl/internal/config"
 	"github.com/markbeep/hyl/internal/db"
 	"github.com/markbeep/hyl/internal/secrets"
@@ -60,6 +61,8 @@ type Worker struct {
 	// exporter drains the outbound queue after every import pass; nil disables
 	// exporting (tests that only exercise importing).
 	exporter *Exporter
+	// sessions is the auth module. The worker tick calls it; the delete lives there.
+	sessions *auth.Service
 
 	// newProvider is the seam tests use to replace the HTTP client.
 	newProvider func(conn db.Connection, secret string) Provider
@@ -84,6 +87,9 @@ func NewWorker(pool *sql.DB, cfg config.Config, log *zap.Logger, cipher *secrets
 
 // SetExporter attaches the outbound drainer.
 func (w *Worker) SetExporter(exporter *Exporter) { w.exporter = exporter }
+
+// SetSessions attaches the auth module so the existing tick can expire sessions.
+func (w *Worker) SetSessions(sessions *auth.Service) { w.sessions = sessions }
 
 // Trigger asks for a pass for one user. The buffered channel coalesces bursts,
 // so hammering the endpoint cannot queue up work.
@@ -148,12 +154,13 @@ func importableKind(kind string) bool {
 	return kind == KindIntervalsOAuth || kind == KindIntervalsAPIKey
 }
 
-// expireSessions drops sessions that have outlived their TTL. Resolving a stale
-// cookie deletes the row it looked up, so a session only ever disappeared when
-// its owner came back with it; one that was abandoned outright stayed in the
-// table forever, which for a self-hosted instance means the table only grows.
+// expireSessions asks the auth module to drop sessions that have outlived their
+// lifetime. The delete lives there; this tick only calls it.
 func (w *Worker) expireSessions(ctx context.Context) {
-	removed, err := w.q.DeleteExpiredSessions(ctx, time.Now().Unix())
+	if w.sessions == nil {
+		return
+	}
+	removed, err := w.sessions.ExpireSessions(ctx)
 	if err != nil {
 		w.log.Warn("expiring sessions failed", zap.Error(err))
 		return

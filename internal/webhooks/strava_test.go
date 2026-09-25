@@ -2,6 +2,7 @@ package webhooks
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/markbeep/hyl/internal/config"
 	"github.com/markbeep/hyl/internal/db"
@@ -117,9 +120,13 @@ func TestForgedDeauthorizationIsIgnored(t *testing.T) {
 		})
 	})
 
+	logs := observeHandler(handler)
 	rec := postDeauthorization(t, handler)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 so Strava stops retrying", rec.Code)
+	}
+	if logs.FilterMessage("ignored an unconfirmed strava deauthorization").Len() != 1 {
+		t.Fatal("want the ignored claim logged")
 	}
 	if got := connectionCount(t, queries, userID); got != 1 {
 		t.Fatalf("connections = %d, want the forged claim to leave the connection alone", got)
@@ -151,12 +158,16 @@ func TestGenuineDeauthorizationRemovesTheConnection(t *testing.T) {
 		_, _ = w.Write([]byte(`{"message":"Bad Request","errors":[{"resource":"RefreshToken","field":"refresh_token","code":"invalid"}]}`))
 	})
 
+	logs := observeHandler(handler)
 	rec := postDeauthorization(t, handler)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	if got := connectionCount(t, queries, userID); got != 0 {
 		t.Fatalf("connections = %d, want the revoked connection to be removed", got)
+	}
+	if logs.FilterMessage("strava connection removed after deauthorization").Len() != 1 {
+		t.Fatal("want the confirmed removal logged")
 	}
 }
 
@@ -187,5 +198,67 @@ func TestUnverifiedDeauthorizationIsNotRepeated(t *testing.T) {
 	}
 	if got := connectionCount(t, queries, userID); got != 1 {
 		t.Fatalf("connections = %d, want 1", got)
+	}
+}
+
+func observeHandler(handler *Strava) *observer.ObservedLogs {
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+	handler.Log = logger
+	handler.connections.Log = logger
+	return logs
+}
+
+func failTokenWrites(t *testing.T, pool *sql.DB, times int) {
+	t.Helper()
+	if _, err := pool.Exec(`CREATE TABLE token_write_fails (remaining INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(`INSERT INTO token_write_fails (remaining) VALUES (?)`, times); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(`CREATE TRIGGER fail_token_write
+		BEFORE UPDATE OF access_token_cipher ON connections
+		WHEN (SELECT remaining FROM token_write_fails) > 0
+		BEGIN
+			UPDATE token_write_fails SET remaining = remaining - 1;
+			SELECT RAISE(FAIL, 'token write failed');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeauthorizationStoreFailureIsAcknowledged(t *testing.T) {
+	handler, queries, userID := newStravaHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "access-2", "refresh_token": "refresh-2",
+			"expires_at": time.Now().Add(6 * time.Hour).Unix(),
+		})
+	})
+	failTokenWrites(t, handler.connections.Pool, 2)
+
+	rec := postDeauthorization(t, handler)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 so Strava stops retrying", rec.Code)
+	}
+	if got := connectionCount(t, queries, userID); got != 1 {
+		t.Fatalf("connections = %d, want the unstored rotation to leave the connection", got)
+	}
+}
+
+func TestClientCredentialFailureDoesNotRemoveTheConnection(t *testing.T) {
+	handler, queries, userID := newStravaHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"Bad Request","errors":[{"resource":"Application","field":"client_id","code":"invalid"}]}`))
+	})
+
+	rec := postDeauthorization(t, handler)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := connectionCount(t, queries, userID); got != 1 {
+		t.Fatalf("connections = %d, want a configuration failure to leave the connection", got)
 	}
 }

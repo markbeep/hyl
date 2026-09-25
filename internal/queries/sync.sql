@@ -98,8 +98,11 @@ UPDATE activity_exports
 SET status = ?, remote_id = ?, attempts = ?, last_error = ?, updated_at = ?
 WHERE id = ?;
 
--- name: DeletePendingExportsForUser :execrows
-DELETE FROM activity_exports WHERE user_id = ? AND status = 'pending';
+-- Pending rows are removed only for the target the disconnected provider owns.
+-- Sent and errored rows stay as history. intervals.icu owns no export target.
+-- name: DeletePendingExportsForTarget :execrows
+DELETE FROM activity_exports
+WHERE user_id = ? AND target = ? AND status = 'pending';
 
 -- name: CreateSyncRun :one
 INSERT INTO sync_runs (user_id, connection_kind, started_at)

@@ -255,61 +255,15 @@ func (h *Handlers) UpdateConnection(c echo.Context) error {
 	return c.JSON(http.StatusOK, connectionDTO(updated))
 }
 
-// DeleteConnection disconnects a provider. Deleting the row cascades to nothing
-// else, so the pending exports and import rules are cleaned up explicitly.
+// DeleteConnection disconnects a provider. The cleanup lives on Connections.
 func (h *Handlers) DeleteConnection(c echo.Context) error {
 	user, err := reqctx.RequireUser(c)
 	if err != nil {
 		return err
 	}
-	ctx := c.Request().Context()
-	kind := c.Param("kind")
-
-	conn, err := h.Q.GetConnection(ctx, user.ID, kind)
-	if errors.Is(err, sql.ErrNoRows) {
-		return apperr.NotFound("no such connection")
-	}
-	if err != nil {
+	connections := NewConnections(h.Pool, h.Cfg, h.Log, h.Cipher)
+	if err := connections.Disconnect(c.Request().Context(), user.ID, c.Param("kind")); err != nil {
 		return err
-	}
-
-	if conn.Kind == KindIntervalsOAuth {
-		secret, _ := h.Cipher.DecryptString(conn.AccessTokenCipher)
-		client := NewIntervalsClient(h.Cfg, conn, secret)
-		if err := client.DisconnectApp(ctx); err != nil {
-			// Best effort: the user asked to disconnect, so a failed courtesy
-			// call must not block it.
-			h.Log.Warn("telling intervals.icu about the disconnect failed", zap.Error(err))
-		}
-	}
-	if conn.Kind == KindStravaOAuth {
-		// Same reasoning as above. The refresh token is preferred because
-		// revoking it revokes the access token with it, and it is the only
-		// credential guaranteed to still be current.
-		token, err := h.Cipher.DecryptString(conn.RefreshTokenCipher)
-		if err != nil || token == "" {
-			token, _ = h.Cipher.DecryptString(conn.AccessTokenCipher)
-		}
-		if token != "" {
-			client := NewStravaClient(h.Cfg, "")
-			if err := client.RevokeAccess(ctx, token); err != nil {
-				h.Log.Warn("telling Strava about the disconnect failed", zap.Error(err))
-			}
-		}
-	}
-
-	if _, err := h.Q.DeletePendingExportsForUser(ctx, user.ID); err != nil {
-		return err
-	}
-	if _, err := h.Q.DeleteImportRulesForConnection(ctx, user.ID, kind); err != nil {
-		return err
-	}
-	affected, err := h.Q.DeleteConnection(ctx, user.ID, kind)
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return apperr.NotFound("no such connection")
 	}
 	return c.NoContent(http.StatusNoContent)
 }

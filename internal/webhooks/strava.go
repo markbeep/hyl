@@ -1,7 +1,6 @@
 package webhooks
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -34,10 +33,10 @@ const stravaVerifyCooldown = 5 * time.Minute
 // is therefore confirmed with Strava, whose token endpoint is the only
 // authority on whether access still exists.
 type Strava struct {
-	Q      *db.Queries
-	Cfg    config.Config
-	Log    *zap.Logger
-	Cipher *secrets.Cipher
+	Q           *db.Queries
+	Cfg         config.Config
+	Log         *zap.Logger
+	connections *syncpkg.Connections
 
 	mu       sync.Mutex
 	verified map[int64]time.Time
@@ -45,7 +44,11 @@ type Strava struct {
 
 // NewStrava builds the Strava webhook handler.
 func NewStrava(pool *sql.DB, cfg config.Config, log *zap.Logger, cipher *secrets.Cipher) *Strava {
-	return &Strava{Q: db.New(pool), Cfg: cfg, Log: log, Cipher: cipher}
+	connections := syncpkg.NewConnections(pool, cfg, log, cipher)
+	return &Strava{
+		Q: connections.Q, Cfg: cfg, Log: log,
+		connections: connections,
+	}
 }
 
 // Verify answers Strava's subscription handshake.
@@ -96,76 +99,14 @@ func (h *Strava) Handle(c echo.Context) error {
 		h.Log.Debug("ignoring a repeated deauthorization claim", zap.Int64("owner_id", payload.OwnerID))
 		return c.NoContent(http.StatusOK)
 	}
-	if !h.confirmedRevoked(ctx, conn) {
+	if err := h.connections.Deauthorize(ctx, conn); err != nil {
+		// Acknowledge after logging: a 500 cannot usefully retry because
+		// claimDue already started the cooldown, and a retry after a
+		// rotated-but-unstored pair would look like a genuine revocation.
+		h.Log.Error("confirming the strava deauthorization failed", zap.Error(err), zap.Int64("user_id", conn.UserID))
 		return c.NoContent(http.StatusOK)
 	}
-
-	if _, err := h.Q.DeletePendingExportsForUser(ctx, conn.UserID); err != nil {
-		h.Log.Warn("deleting pending exports failed", zap.Error(err))
-	}
-	if _, err := h.Q.DeleteImportRulesForConnection(ctx, conn.UserID, syncpkg.KindStravaOAuth); err != nil {
-		h.Log.Warn("deleting import rules failed", zap.Error(err))
-	}
-	if _, err := h.Q.DeleteConnection(ctx, conn.UserID, syncpkg.KindStravaOAuth); err != nil {
-		h.Log.Error("deleting the Strava connection failed", zap.Error(err))
-		return c.NoContent(http.StatusOK)
-	}
-	h.Log.Info("strava connection removed after deauthorization", zap.Int64("user_id", conn.UserID))
 	return c.NoContent(http.StatusOK)
-}
-
-// confirmedRevoked asks Strava whether this connection's access was really
-// revoked. Only a rejection of the stored refresh token proves it: a transient
-// failure proves nothing, and a successful refresh proves the claim was forged.
-func (h *Strava) confirmedRevoked(ctx context.Context, conn db.Connection) bool {
-	refreshToken, err := h.Cipher.DecryptString(conn.RefreshTokenCipher)
-	if err != nil || refreshToken == "" {
-		h.Log.Warn("cannot confirm a deauthorization without a stored refresh token",
-			zap.Int64("user_id", conn.UserID), zap.Error(err))
-		return false
-	}
-
-	tokens, err := syncpkg.CheckStravaRefresh(ctx, h.Cfg, refreshToken)
-	if err == nil {
-		// Strava still honours the credential, so the event was not
-		// authoritative. The check rotated the pair, and Strava invalidates the
-		// previous refresh token the moment it issues a new one, so the fresh
-		// pair has to be stored or the connection would be bricked.
-		h.persistRotation(ctx, conn, tokens)
-		h.Log.Info("ignored an unconfirmed strava deauthorization", zap.Int64("user_id", conn.UserID))
-		return false
-	}
-
-	var providerErr *syncpkg.ProviderError
-	if !errors.As(err, &providerErr) {
-		h.Log.Warn("could not confirm a strava deauthorization", zap.Error(err))
-		return false
-	}
-	switch providerErr.StatusCode {
-	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-		// An unknown or invalid refresh token: the revocation is genuine.
-		return true
-	}
-	h.Log.Warn("could not confirm a strava deauthorization", zap.Error(err))
-	return false
-}
-
-// persistRotation stores the token pair a confirmation refresh produced.
-func (h *Strava) persistRotation(ctx context.Context, conn db.Connection, tokens syncpkg.StravaTokens) {
-	access, err := h.Cipher.EncryptString(tokens.AccessToken)
-	if err != nil {
-		h.Log.Error("encrypting the rotated access token failed", zap.Error(err))
-		return
-	}
-	refresh, err := h.Cipher.EncryptString(tokens.RefreshToken)
-	if err != nil {
-		h.Log.Error("encrypting the rotated refresh token failed", zap.Error(err))
-		return
-	}
-	expiresAt := tokens.ExpiresAt
-	if _, err := h.Q.UpdateConnectionTokens(ctx, access, refresh, &expiresAt, time.Now().Unix(), conn.ID); err != nil {
-		h.Log.Error("persisting the rotated strava tokens failed", zap.Error(err))
-	}
 }
 
 // claimDue reports whether this athlete's claim should be checked now, and
